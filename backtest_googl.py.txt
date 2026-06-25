@@ -32,12 +32,18 @@ TICKER          = "GOOGL"
 START           = "2022-01-01"
 END             = "2026-06-25"
 CAPITAL_INICIAL = 1000.0     # EUR (paper trading)
-RIESGO_PCT      = 0.01       # 1% del capital por operacion
+RIESGO_PCT      = 0.02       # 2% del capital por operacion (combo equilibrado del barrido)
 LOOKBACK        = 20         # dias para resistencia movil y media de volumen
 RATIO_TP        = 2.0        # take-profit = 2x el riesgo (1:2)
 STOP_ATR_MULT   = 1.5        # stop = N * ATR por debajo de la entrada
 COMISION        = 1.0        # EUR por operacion (entrada y salida cada una)
 SLIPPAGE_PCT    = 0.0005     # 0.05% de deslizamiento estimado por ejecucion
+
+# --- Mejoras de estrategia (v2) ---
+USAR_TENDENCIA  = True       # solo comprar si el precio esta por encima de la SMA larga
+TENDENCIA_SMA   = 200        # periodo de la media de tendencia (filtro pro-tendencia)
+USAR_TRAILING   = True       # dejar correr ganadores con trailing stop en vez de TP fijo
+TRAIL_ATR_MULT  = 4.0        # distancia del trailing stop (chandelier exit) en ATR
 # ----------------------------------------------------------------------
 
 
@@ -70,6 +76,7 @@ def backtest(df):
     df["resistencia"] = df["High"].rolling(LOOKBACK).max().shift(1)
     df["vol_media"]   = df["Volume"].rolling(LOOKBACK).mean().shift(1)
     df["atr"]         = calcular_atr(df).shift(1)
+    df["sma_tend"]    = df["Close"].rolling(TENDENCIA_SMA).mean().shift(1)
     df = df.dropna()
 
     capital = CAPITAL_INICIAL
@@ -87,8 +94,8 @@ def backtest(df):
             # El stop se comprueba primero (conservador: asumimos lo peor)
             if fila["Low"] <= posicion["stop"]:
                 salida = posicion["stop"]
-                motivo = "stop"
-            elif fila["High"] >= posicion["target"]:
+                motivo = "trailing" if posicion["trailing_activo"] else "stop"
+            elif not USAR_TRAILING and fila["High"] >= posicion["target"]:
                 salida = posicion["target"]
                 motivo = "target"
 
@@ -107,12 +114,23 @@ def backtest(df):
                     "capital": round(capital, 2),
                 })
                 posicion = None
+            elif USAR_TRAILING:
+                # Dejar correr al ganador: subir el stop siguiendo el maximo alcanzado
+                # (chandelier exit). El stop solo sube, nunca baja -> no mira el futuro.
+                posicion["max_high"] = max(posicion["max_high"], fila["High"])
+                nuevo_stop = posicion["max_high"] - TRAIL_ATR_MULT * posicion["atr_entrada"]
+                if nuevo_stop > posicion["stop"]:
+                    posicion["stop"] = nuevo_stop
+                    posicion["trailing_activo"] = True
 
         # --- Buscar nueva entrada (solo si no hay posicion) ---
         if posicion is None:
             rompe = precio_open > fila["resistencia"]
             vol_ok = fila["Volume"] > fila["vol_media"]
-            if rompe and vol_ok and fila["atr"] > 0:
+            # Filtro pro-tendencia: solo operar al alza si el precio esta por encima
+            # de la media larga (evita comprar rupturas en mercados bajistas/laterales).
+            tendencia_ok = (not USAR_TENDENCIA) or (precio_open > fila["sma_tend"])
+            if rompe and vol_ok and tendencia_ok and fila["atr"] > 0:
                 entrada = precio_open * (1 + SLIPPAGE_PCT)
                 stop = entrada - STOP_ATR_MULT * fila["atr"]
                 riesgo_accion = entrada - stop
@@ -130,6 +148,9 @@ def backtest(df):
                                 "stop": stop,
                                 "target": entrada + RATIO_TP * riesgo_accion,
                                 "acciones": acciones,
+                                "max_high": fila["High"],
+                                "atr_entrada": fila["atr"],
+                                "trailing_activo": False,
                             }
 
         # equity = capital liquido + valor de posicion abierta (marcado a cierre)
@@ -178,8 +199,9 @@ def metricas(capital_final, eq, tr, df):
     print(f"  Beneficio medio:   {ganadoras['pnl'].mean() if len(ganadoras) else 0:+.2f} EUR")
     print(f"  Perdida media:     {perdedoras['pnl'].mean() if len(perdedoras) else 0:+.2f} EUR")
     print(f"  Max drawdown:      {max_dd:.1f}%")
-    print(f"  Salidas por stop:  {len(tr[tr['motivo']=='stop'])}")
-    print(f"  Salidas por target: {len(tr[tr['motivo']=='target'])}")
+    print("  Salidas por motivo:")
+    for motivo, cuenta in tr["motivo"].value_counts().items():
+        print(f"    - {motivo}: {cuenta}")
     print("\n  Ultimas operaciones:")
     print(tr.tail(8).to_string(index=False))
 

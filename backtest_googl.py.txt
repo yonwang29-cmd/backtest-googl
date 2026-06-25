@@ -24,15 +24,16 @@ USO REAL:
   (descarga GOOGL automaticamente; cambia TICKER/fechas abajo)
 """
 
+import datetime
 import numpy as np
 import pandas as pd
 
 # ----------------------------- PARAMETROS -----------------------------
 TICKER          = "GOOGL"
 START           = "2022-01-01"
-END             = "2026-06-25"
+END             = datetime.date.today().isoformat()   # siempre usa la fecha de hoy
 CAPITAL_INICIAL = 1000.0     # EUR (paper trading)
-RIESGO_PCT      = 0.02       # 2% del capital por operacion (combo equilibrado del barrido)
+RIESGO_PCT      = 0.02       # 2% del capital por operacion (decision propia de gestion de riesgo)
 LOOKBACK        = 20         # dias para resistencia movil y media de volumen
 RATIO_TP        = 2.0        # take-profit = 2x el riesgo (1:2)
 STOP_ATR_MULT   = 1.5        # stop = N * ATR por debajo de la entrada
@@ -136,8 +137,8 @@ def backtest(df):
                 riesgo_accion = entrada - stop
                 if riesgo_accion > 0:
                     riesgo_eur = capital * RIESGO_PCT
-                    acciones = int(riesgo_eur / riesgo_accion)
-                    if acciones >= 1:
+                    acciones = round(riesgo_eur / riesgo_accion, 4)  # fraccionadas (T212/IBKR)
+                    if acciones > 0:
                         coste = acciones * entrada
                         # no apalancamiento: no invertir mas del capital disponible
                         if coste <= capital:

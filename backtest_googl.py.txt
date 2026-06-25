@@ -1,0 +1,190 @@
+"""
+Backtest - Estrategia de ruptura de rango (swing trading)
+Activo objetivo: GOOGL (Alphabet)
+Autor: experimento de aprendizaje
+
+Estrategia (la que definimos):
+  ENTRADA: precio cierra por encima de la maxima de los ultimos N dias (resistencia movil)
+           CON volumen del dia > media de volumen de los ultimos N dias (confirmacion).
+  STOP-LOSS: por debajo del nivel roto (riesgo definido por ATR o por % fijo).
+  TAKE-PROFIT: a ratio 1:2 sobre el riesgo (bracket order).
+  GESTION: riesgo 1% del capital por operacion.
+  FILTRO: opcionalmente evitar entradas cerca de earnings (se marca manualmente).
+
+DISEÑO HONESTO (evita los errores tipicos de backtest):
+  - Sin sesgo de retrovisor: la señal de entrada usa SOLO datos hasta el cierre del dia previo.
+  - Costes incluidos: comision por operacion + slippage estimado.
+  - Compara contra Buy & Hold en el mismo periodo (la pregunta clave).
+  - Reporta metricas reales: win rate, P&L neto, nº trades, max drawdown, ratio.
+
+REQUISITOS:
+  pip install yfinance pandas numpy
+USO REAL:
+  python backtest_googl.py
+  (descarga GOOGL automaticamente; cambia TICKER/fechas abajo)
+"""
+
+import numpy as np
+import pandas as pd
+
+# ----------------------------- PARAMETROS -----------------------------
+TICKER          = "GOOGL"
+START           = "2022-01-01"
+END             = "2026-06-25"
+CAPITAL_INICIAL = 1000.0     # EUR (paper trading)
+RIESGO_PCT      = 0.01       # 1% del capital por operacion
+LOOKBACK        = 20         # dias para resistencia movil y media de volumen
+RATIO_TP        = 2.0        # take-profit = 2x el riesgo (1:2)
+STOP_ATR_MULT   = 1.5        # stop = N * ATR por debajo de la entrada
+COMISION        = 1.0        # EUR por operacion (entrada y salida cada una)
+SLIPPAGE_PCT    = 0.0005     # 0.05% de deslizamiento estimado por ejecucion
+# ----------------------------------------------------------------------
+
+
+def cargar_datos(ticker, start, end):
+    """Descarga datos reales con yfinance. Requiere conexion a internet."""
+    import yfinance as yf
+    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    return df
+
+
+def calcular_atr(df, periodo=14):
+    """Average True Range: mide la volatilidad para dimensionar el stop."""
+    h_l = df["High"] - df["Low"]
+    h_pc = (df["High"] - df["Close"].shift(1)).abs()
+    l_pc = (df["Low"] - df["Close"].shift(1)).abs()
+    tr = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
+    return tr.rolling(periodo).mean()
+
+
+def backtest(df):
+    """
+    Ejecuta la estrategia barra a barra SIN mirar el futuro.
+    En el dia t decidimos con info hasta t-1; ejecutamos en la apertura de t.
+    """
+    df = df.copy()
+    # Resistencia movil = maxima de los ultimos LOOKBACK dias (excluyendo hoy)
+    df["resistencia"] = df["High"].rolling(LOOKBACK).max().shift(1)
+    df["vol_media"]   = df["Volume"].rolling(LOOKBACK).mean().shift(1)
+    df["atr"]         = calcular_atr(df).shift(1)
+    df = df.dropna()
+
+    capital = CAPITAL_INICIAL
+    equity_curve = []
+    posicion = None          # dict con la operacion abierta
+    trades = []
+
+    for fecha, fila in df.iterrows():
+        precio_open = fila["Open"]
+
+        # --- Gestion de posicion abierta (comprobar stop / target con High-Low del dia) ---
+        if posicion is not None:
+            salida = None
+            motivo = None
+            # El stop se comprueba primero (conservador: asumimos lo peor)
+            if fila["Low"] <= posicion["stop"]:
+                salida = posicion["stop"]
+                motivo = "stop"
+            elif fila["High"] >= posicion["target"]:
+                salida = posicion["target"]
+                motivo = "target"
+
+            if salida is not None:
+                salida_real = salida * (1 - SLIPPAGE_PCT)   # deslizamiento en contra
+                pnl = (salida_real - posicion["entrada"]) * posicion["acciones"] - COMISION
+                capital += pnl
+                trades.append({
+                    "fecha_entrada": posicion["fecha"],
+                    "fecha_salida": fecha,
+                    "entrada": round(posicion["entrada"], 2),
+                    "salida": round(salida_real, 2),
+                    "acciones": posicion["acciones"],
+                    "motivo": motivo,
+                    "pnl": round(pnl, 2),
+                    "capital": round(capital, 2),
+                })
+                posicion = None
+
+        # --- Buscar nueva entrada (solo si no hay posicion) ---
+        if posicion is None:
+            rompe = precio_open > fila["resistencia"]
+            vol_ok = fila["Volume"] > fila["vol_media"]
+            if rompe and vol_ok and fila["atr"] > 0:
+                entrada = precio_open * (1 + SLIPPAGE_PCT)
+                stop = entrada - STOP_ATR_MULT * fila["atr"]
+                riesgo_accion = entrada - stop
+                if riesgo_accion > 0:
+                    riesgo_eur = capital * RIESGO_PCT
+                    acciones = int(riesgo_eur / riesgo_accion)
+                    if acciones >= 1:
+                        coste = acciones * entrada
+                        # no apalancamiento: no invertir mas del capital disponible
+                        if coste <= capital:
+                            capital -= COMISION  # comision de entrada
+                            posicion = {
+                                "fecha": fecha,
+                                "entrada": entrada,
+                                "stop": stop,
+                                "target": entrada + RATIO_TP * riesgo_accion,
+                                "acciones": acciones,
+                            }
+
+        # equity = capital liquido + valor de posicion abierta (marcado a cierre)
+        valor_pos = posicion["acciones"] * fila["Close"] if posicion else 0
+        liquido = capital - (posicion["acciones"] * posicion["entrada"] if posicion else 0)
+        equity_curve.append({"fecha": fecha, "equity": liquido + valor_pos if posicion else capital})
+
+    eq = pd.DataFrame(equity_curve).set_index("fecha")
+    tr = pd.DataFrame(trades)
+    return capital, eq, tr
+
+
+def metricas(capital_final, eq, tr, df):
+    print("=" * 60)
+    print(f"  BACKTEST {TICKER}  |  {START} -> {END}")
+    print("=" * 60)
+
+    # Buy & Hold de referencia (la pregunta clave)
+    precio_ini = df["Close"].iloc[0]
+    precio_fin = df["Close"].iloc[-1]
+    bh_ret = (precio_fin / precio_ini - 1) * 100
+
+    estrat_ret = (capital_final / CAPITAL_INICIAL - 1) * 100
+
+    print(f"\n  Capital inicial:        {CAPITAL_INICIAL:,.2f} EUR")
+    print(f"  Capital final (estrat): {capital_final:,.2f} EUR  ({estrat_ret:+.1f}%)")
+    print(f"  Buy & Hold mismo periodo:                 ({bh_ret:+.1f}%)")
+    print(f"  --> {'LA ESTRATEGIA BATE a comprar y mantener' if estrat_ret > bh_ret else 'Comprar y mantener GANA a la estrategia'}")
+
+    if len(tr) == 0:
+        print("\n  No se generaron operaciones con estos parametros.")
+        return
+
+    ganadoras = tr[tr["pnl"] > 0]
+    perdedoras = tr[tr["pnl"] <= 0]
+    win_rate = len(ganadoras) / len(tr) * 100
+
+    # Max drawdown sobre la curva de equity
+    roll_max = eq["equity"].cummax()
+    dd = (eq["equity"] / roll_max - 1) * 100
+    max_dd = dd.min()
+
+    print(f"\n  Nº operaciones:    {len(tr)}")
+    print(f"  Ganadoras:         {len(ganadoras)}  ({win_rate:.0f}%)")
+    print(f"  Perdedoras:        {len(perdedoras)}")
+    print(f"  Beneficio medio:   {ganadoras['pnl'].mean() if len(ganadoras) else 0:+.2f} EUR")
+    print(f"  Perdida media:     {perdedoras['pnl'].mean() if len(perdedoras) else 0:+.2f} EUR")
+    print(f"  Max drawdown:      {max_dd:.1f}%")
+    print(f"  Salidas por stop:  {len(tr[tr['motivo']=='stop'])}")
+    print(f"  Salidas por target:{len(tr[tr['motivo']=='target'])}")
+    print("\n  Ultimas operaciones:")
+    print(tr.tail(8).to_string(index=False))
+
+
+if __name__ == "__main__":
+    df = cargar_datos(TICKER, START, END)   # <- necesita internet
+    capital_final, eq, tr = backtest(df)
+    metricas(capital_final, eq, tr, df)

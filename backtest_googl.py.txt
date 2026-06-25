@@ -179,7 +179,7 @@ def metricas(capital_final, eq, tr, df):
     print(f"  Perdida media:     {perdedoras['pnl'].mean() if len(perdedoras) else 0:+.2f} EUR")
     print(f"  Max drawdown:      {max_dd:.1f}%")
     print(f"  Salidas por stop:  {len(tr[tr['motivo']=='stop'])}")
-    print(f"  Salidas por target:{len(tr[tr['motivo']=='target'])}")
+    print(f"  Salidas por target: {len(tr[tr['motivo']=='target'])}")
     print("\n  Ultimas operaciones:")
     print(tr.tail(8).to_string(index=False))
 
